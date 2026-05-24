@@ -7,12 +7,15 @@ import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
+import android.bluetooth.BluetoothProfile;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 
 import com.limelight.LimeLog;
 import com.limelight.nvstream.input.ControllerPacket;
+import com.limelight.nvstream.jni.MoonBridge;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -36,14 +39,16 @@ public class SteamController extends AbstractController {
     static public final UUID reportCharacteristic = UUID.fromString("100F6C34-1735-4313-B402-38567131E5F3");
     static private final byte[] enterValveMode = new byte[] { (byte)0xC0, (byte)0x87, 0x03, 0x08, 0x07, 0x00 };
     private boolean mIsRegistered;
+    private volatile boolean mShouldReconnect = false;
 
 
     @SuppressLint("NewApi")
     private class Callback extends BluetoothGattCallback
     {
+        @SuppressLint("MissingPermission")
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-            if(newState == 2) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
                 mHandler.post(new Runnable() {
                     @SuppressLint("MissingPermission")
                     @Override
@@ -51,6 +56,17 @@ public class SteamController extends AbstractController {
                         mGatt.discoverServices();
                     }
                 });
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                if (mShouldReconnect) {
+                    // Intentional reconnect: close old GATT then open a fresh connection.
+                    // Do NOT notify removal — the controller stays registered with the host.
+                    mShouldReconnect = false;
+                    gatt.close();
+                    mGatt = connectGatt(false);
+                } else {
+                    mIsRegistered = false;
+                    notifyDeviceRemoved();
+                }
             }
         }
 
@@ -98,12 +114,17 @@ public class SteamController extends AbstractController {
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
-            // Enable this for verbose logging of controller input reports
-            //Log.v(TAG, "onCharacteristicChanged uuid=" + characteristic.getUuid() + " data=" + Arrays.toString(characteristic.getValue()));
-
+            // Called on Android < API 33
             if (characteristic.getUuid().equals(inputCharacteristic)) {
-                //mManager.HIDDeviceInputReport(getId(), characteristic.getValue());
                 handleRead(ByteBuffer.wrap(characteristic.getValue()));
+            }
+        }
+
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value) {
+            // Called on Android API 33+ — value param is reliable, do NOT call characteristic.getValue()
+            if (characteristic.getUuid().equals(inputCharacteristic)) {
+                handleRead(ByteBuffer.wrap(value));
             }
         }
 
@@ -114,12 +135,14 @@ public class SteamController extends AbstractController {
             //Log.v(TAG, "onDescriptorWrite status=" + status + " uuid=" + chr.getUuid() + " descriptor=" + descriptor.getUuid());
 
             if (chr.getUuid().equals(inputCharacteristic)) {
-                boolean hasWrittenInputDescriptor = true;
                 BluetoothGattCharacteristic reportChr = chr.getService().getCharacteristic(reportCharacteristic);
                 if (reportChr != null) {
-                    //Log.v(TAG, "Writing report characteristic to enter valve mode");
-                    reportChr.setValue(enterValveMode);
-                    gatt.writeCharacteristic(reportChr);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(reportChr, enterValveMode, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+                    } else {
+                        reportChr.setValue(enterValveMode);
+                        gatt.writeCharacteristic(reportChr);
+                    }
                 }
             }
 
@@ -137,12 +160,25 @@ public class SteamController extends AbstractController {
 
     public SteamController(UsbDriverListener listener, BluetoothDriverService manager, BluetoothDevice device)
     {
-        super(0x1234, listener, 0, 0);
+        super(0x1234, listener, 0x28de, 0x1102);
         mManager = manager;
         mDevice = device;
         mCallback = new Callback();
         mHandler = new Handler(Looper.getMainLooper());
         mOperations = new LinkedList<>();
+
+        this.type = MoonBridge.LI_CTYPE_UNKNOWN;
+        this.capabilities = (short)(MoonBridge.LI_CCAP_ANALOG_TRIGGERS | MoonBridge.LI_CCAP_RUMBLE);
+        this.supportedButtonFlags =
+            ControllerPacket.A_FLAG | ControllerPacket.B_FLAG |
+            ControllerPacket.X_FLAG | ControllerPacket.Y_FLAG |
+            ControllerPacket.UP_FLAG | ControllerPacket.DOWN_FLAG |
+            ControllerPacket.LEFT_FLAG | ControllerPacket.RIGHT_FLAG |
+            ControllerPacket.LB_FLAG | ControllerPacket.RB_FLAG |
+            ControllerPacket.LS_CLK_FLAG | ControllerPacket.RS_CLK_FLAG |
+            ControllerPacket.PLAY_FLAG | ControllerPacket.BACK_FLAG |
+            ControllerPacket.SPECIAL_BUTTON_FLAG |
+            ControllerPacket.PADDLE1_FLAG | ControllerPacket.PADDLE2_FLAG;
 
         mGatt = connectGatt(false);
     }
@@ -223,13 +259,13 @@ public class SteamController extends AbstractController {
             setButtonFlag(ControllerPacket.SPECIAL_BUTTON_FLAG, (int) (b & 0x00002000));
             setButtonFlag(ControllerPacket.PLAY_FLAG, (int) (b & 0x00004000));
 
-            LimeLog.info("Buttons: "+Long.toBinaryString(b));
+            Log.v(TAG, "Buttons: "+Long.toBinaryString(b));
         }
         if((type & BLEButtonChunk2) != 0)
         {
             int left = Byte.toUnsignedInt(buffer.get());
             int right = Byte.toUnsignedInt(buffer.get());
-            LimeLog.info("Triggers: "+left+" | "+right);
+            Log.v(TAG, "Triggers: "+left+" | "+right);
             leftTrigger = left/255.0f;
             rightTrigger = right/255.0f;
         }
@@ -237,12 +273,15 @@ public class SteamController extends AbstractController {
         {
             byte[] buttons = new byte[3];
             buffer.get(buttons);
+            long b = Byte.toUnsignedLong(buttons[0]) | Byte.toUnsignedLong(buttons[1]) << 8 | Byte.toUnsignedLong(buttons[2]) << 16;
+            setButtonFlag(ControllerPacket.PADDLE1_FLAG, (int)(b & 0x00000001)); // left grip
+            setButtonFlag(ControllerPacket.PADDLE2_FLAG, (int)(b & 0x00000002)); // right grip
         }
         if((type & BLELeftJoystickChunk) != 0)
         {
             int x = buffer.getShort();
             int y = ~buffer.getShort();
-            LimeLog.info("Joystick: "+x+" | "+y);
+            Log.v(TAG, "Joystick: "+x+" | "+y);
             leftStickX = x / (float)Short.MAX_VALUE;
             leftStickY = y / (float)Short.MAX_VALUE;
         }
@@ -255,7 +294,7 @@ public class SteamController extends AbstractController {
         {
             int x = buffer.getShort();
             int y = ~buffer.getShort();
-            LimeLog.info("Right Pad: "+x+" | "+y);
+            Log.v(TAG, "Right Pad: "+x+" | "+y);
             rightStickX = x / (float)Short.MAX_VALUE;
             rightStickY = y / (float)Short.MAX_VALUE;
         }
@@ -269,23 +308,46 @@ public class SteamController extends AbstractController {
         return false;
     }
 
+    @SuppressLint("MissingPermission")
     @Override
     public void stop() {
-
+        mShouldReconnect = false;
+        if (mGatt != null) {
+            mGatt.disconnect();
+            mGatt.close();
+            mGatt = null;
+        }
+        mIsRegistered = false;
     }
 
     @Override
     public void rumble(short lowFreqMotor, short highFreqMotor) {
-        // TODO: Implement rumble
+        if (!isRegistered()) return;
+        byte[] hapticCmd = new byte[] {
+            (byte)0x8f, (byte)0x07,
+            (byte)(lowFreqMotor & 0xFF),  (byte)((lowFreqMotor >> 8) & 0xFF),   // left pad amplitude
+            (byte)(highFreqMotor & 0xFF), (byte)((highFreqMotor >> 8) & 0xFF),  // right pad amplitude
+            (byte)0xe8, (byte)0x03  // period ~1000µs
+        };
+        writeCharacteristic(reportCharacteristic, hapticCmd);
     }
 
     @Override
     public void rumbleTriggers(short leftTrigger, short rightTrigger) {
-        // TODO: Implement rumble
+        // Steam Controller has no trigger haptics; delegate to main rumble
+        rumble(leftTrigger, rightTrigger);
     }
 
+    @SuppressLint("MissingPermission")
     public void reconnect() {
-        // TODO: Implement reconnect
+        mIsRegistered = false;
+        mShouldReconnect = true;
+        if (mGatt != null) {
+            mGatt.disconnect(); // triggers onConnectionStateChange(STATE_DISCONNECTED)
+        } else {
+            mShouldReconnect = false;
+            mGatt = connectGatt(false);
+        }
     }
 
     static class GattOperation {
@@ -332,12 +394,20 @@ public class SteamController extends AbstractController {
                     break;
                 case CHR_WRITE:
                     chr = getCharacteristic(mUuid);
-                    //Log.v(TAG, "Writing characteristic " + chr.getUuid() + " value=" + HexDump.toHexString(value));
-                    chr.setValue(mValue);
-                    if (!mGatt.writeCharacteristic(chr)) {
-                        LimeLog.warning("Unable to write characteristic " + mUuid.toString());
-                        mResult = false;
-                        break;
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        int writeResult = mGatt.writeCharacteristic(chr, mValue, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+                        if (writeResult != BluetoothGatt.GATT_SUCCESS) {
+                            LimeLog.warning("Unable to write characteristic " + mUuid.toString());
+                            mResult = false;
+                            break;
+                        }
+                    } else {
+                        chr.setValue(mValue);
+                        if (!mGatt.writeCharacteristic(chr)) {
+                            LimeLog.warning("Unable to write characteristic " + mUuid.toString());
+                            mResult = false;
+                            break;
+                        }
                     }
                     mResult = true;
                     break;
@@ -360,11 +430,20 @@ public class SteamController extends AbstractController {
                             }
 
                             mGatt.setCharacteristicNotification(chr, true);
-                            cccd.setValue(value);
-                            if (!mGatt.writeDescriptor(cccd)) {
-                                LimeLog.warning("Unable to write descriptor " + mUuid.toString());
-                                mResult = false;
-                                return;
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                int writeResult = mGatt.writeDescriptor(cccd, value);
+                                if (writeResult != BluetoothGatt.GATT_SUCCESS) {
+                                    LimeLog.warning("Unable to write descriptor " + mUuid.toString());
+                                    mResult = false;
+                                    return;
+                                }
+                            } else {
+                                cccd.setValue(value);
+                                if (!mGatt.writeDescriptor(cccd)) {
+                                    LimeLog.warning("Unable to write descriptor " + mUuid.toString());
+                                    mResult = false;
+                                    return;
+                                }
                             }
                             mResult = true;
                         }

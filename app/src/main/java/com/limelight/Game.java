@@ -247,6 +247,11 @@ public class Game extends FragmentActivity implements SurfaceHolder.Callback,
         prefConfig = PreferenceConfiguration.readPreferences(this);
         tombstonePrefs = Game.this.getSharedPreferences("DecoderTombstone", 0);
 
+        // Keep the display on during streaming if preference is enabled
+        if (prefConfig.keepScreenOn) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+
         // Enter landscape unless we're on a square screen
         setPreferredOrientationForCurrentDisplay();
 
@@ -2447,9 +2452,6 @@ public class Game extends FragmentActivity implements SurfaceHolder.Callback,
                         setInputGrabState(true);
                     }
                 }, 500);
-
-                // Keep the display on
-                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
                 // Update GameManager state to indicate we're in game
                 UiHelper.notifyStreamConnected(Game.this);
